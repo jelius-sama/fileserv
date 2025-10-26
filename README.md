@@ -33,9 +33,10 @@ fileserv/
 ## Installation
 
 ```bash
-# Clone or download the files
-# Initialize the Go module
-go mod tidy
+# Clone the repository
+git clone https://github.com/jelius-sama/fileserv
+cd fileserv
+
 
 # Build the binary
 ./build.sh
