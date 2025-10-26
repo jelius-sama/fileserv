@@ -37,7 +37,6 @@ fileserv/
 git clone https://github.com/jelius-sama/fileserv
 cd fileserv
 
-
 # Build the binary
 ./build.sh
 ```
