@@ -1,152 +1,193 @@
 package main
 
 import (
-	"flag"
-	"html/template"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
-	"sort"
+	"strings"
+
+	"fileserv/internal/handler"
+	"fileserv/internal/server"
 )
 
-type FileInfo struct {
-	Name  string
-	IsDir bool
-	Path  string
-}
+const version = "1.0.0"
 
-type Dir struct {
-	Name string
-	Path string
-}
-
-var directories []string
-
-func dirListing(w http.ResponseWriter, r *http.Request, fsPath string) {
-	f, err := os.Open(fsPath)
-	if err != nil {
-		http.Error(w, "Forbidden", http.StatusForbidden)
-		return
-	}
-	defer f.Close()
-
-	files, err := f.Readdir(-1)
-	if err != nil {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
-	}
-
-	var fileInfos []FileInfo
-	for _, file := range files {
-		fileInfos = append(fileInfos, FileInfo{
-			Name:  file.Name(),
-			IsDir: file.IsDir(),
-			Path:  filepath.Join(r.URL.Path, file.Name()),
-		})
-	}
-
-	// Sort directories first
-	sort.Slice(fileInfos, func(i, j int) bool {
-		if fileInfos[i].IsDir && !fileInfos[j].IsDir {
-			return true
-		} else if !fileInfos[i].IsDir && fileInfos[j].IsDir {
-			return false
+// expandTilde expands ~ to the user's home directory
+func expandTilde(path string) string {
+	if strings.HasPrefix(path, "~/") {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			return filepath.Join(home, path[2:])
 		}
-		return fileInfos[i].Name < fileInfos[j].Name
-	})
-
-	tmpl := `
-<!DOCTYPE html>
-<html>
-<head>
-<title>Index of {{.Path}}</title>
-<style>
-	body { font-family: sans-serif; }
-	.dir { font-weight: bold; }
-</style>
-</head>
-<body>
-<h1>Index of {{.Path}}</h1>
-<ul>
-{{range .Files}}
-	<li class="{{if .IsDir}}dir{{end}}">
-		<a href="{{.Path}}{{if .IsDir}}/{{end}}">{{.Name}}{{if .IsDir}}/{{end}}</a>
-	</li>
-{{end}}
-</ul>
-</body>
-</html>
-`
-	t, err := template.New("dir").Parse(tmpl)
-	if err != nil {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-		return
 	}
-
-	data := struct {
-		Path  string
-		Files []FileInfo
-	}{
-		Path:  r.URL.Path,
-		Files: fileInfos,
-	}
-
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	t.Execute(w, data)
-}
-
-func fileHandler(rootDirs []string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// Match the request path to the correct root directory
-		for _, dir := range rootDirs {
-			fsPath := filepath.Join(dir, r.URL.Path)
-			info, err := os.Stat(fsPath)
-			if os.IsNotExist(err) {
-				continue
-			} else if err != nil {
-				http.Error(w, "Internal Server Error", http.StatusInternalServerError)
-				return
-			}
-
-			if info.IsDir() {
-				dirListing(w, r, fsPath)
-				return
-			}
-
-			// Serve the file with correct MIME type
-			http.ServeFile(w, r, fsPath)
-			return
+	if path == "~" {
+		home, err := os.UserHomeDir()
+		if err == nil {
+			return home
 		}
-
-		http.NotFound(w, r)
 	}
+	return path
 }
 
 func main() {
-	port := flag.String("port", "8000", "Port to serve HTTP on")
-	flag.Parse()
+	var directories []string
+	var port string
+	var showVersion bool
+	var showHelp bool
 
-	directories = flag.Args()
+	// Manual flag parsing to handle mixed flags and arguments
+	args := os.Args[1:]
+
+	i := 0
+	for i < len(args) {
+		arg := args[i]
+
+		switch arg {
+		case "-port", "--port":
+			if i+1 < len(args) {
+				port = args[i+1]
+				i += 2
+			} else {
+				i++
+			}
+		case "-dir", "--dir":
+			i++
+			// Collect all following arguments until we hit another flag
+			for i < len(args) && !strings.HasPrefix(args[i], "-") {
+				// Check if this argument contains commas (comma-separated list)
+				if strings.Contains(args[i], ",") {
+					// Split by comma and add each part
+					parts := strings.Split(args[i], ",")
+					for _, part := range parts {
+						trimmed := strings.TrimSpace(part)
+						if trimmed != "" {
+							directories = append(directories, expandTilde(trimmed))
+						}
+					}
+				} else {
+					// Single directory (tilde already expanded by shell for space-separated args)
+					directories = append(directories, args[i])
+				}
+				i++
+			}
+		case "-version", "--version":
+			showVersion = true
+			i++
+		case "-help", "--help", "-h":
+			showHelp = true
+			i++
+		default:
+			// If it doesn't start with -, treat it as a directory
+			if !strings.HasPrefix(arg, "-") {
+				directories = append(directories, args[i])
+			}
+			i++
+		}
+	}
+
+	// Set default port if not specified
+	if port == "" {
+		port = "8000"
+	}
+
+	// Handle version flag
+	if showVersion {
+		fmt.Printf("fileserv version %s\n", version)
+		os.Exit(0)
+	}
+
+	// Handle help flag
+	if showHelp {
+		printHelp()
+		os.Exit(0)
+	}
+
+	// If no directories specified, use current directory
 	if len(directories) == 0 {
-		// Default to current directory if none provided
 		dir, err := os.Getwd()
 		if err != nil {
 			log.Fatal(err)
 		}
 		directories = append(directories, dir)
-	} else {
-		// Validate directories
-		for _, d := range directories {
-			info, err := os.Stat(d)
-			if err != nil || !info.IsDir() {
-				log.Fatalf("Invalid directory: %s", d)
-			}
-		}
 	}
 
-	http.HandleFunc("/", fileHandler(directories))
+	// Validate directories
+	validDirs, err := server.ValidateDirectories(directories)
+	if err != nil {
+		log.Fatal(err)
+	}
 
-	log.Printf("Serving directories %v on HTTP port: %s\n", directories, *port)
-	log.Fatal(http.ListenAndServe(":"+*port, nil))
+	// Create file server
+	fs := handler.NewFileServer(validDirs)
+
+	// Setup routes
+	http.HandleFunc("/", fs.HandleRequest)
+
+	log.Printf("Serving directories %v on HTTP port: %s\n", validDirs, port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
+}
+
+func printHelp() {
+	fmt.Println(`
+  ╔══════════════════════════════════════════════════════════════════╗
+  ║                                                                  ║
+  ║   ███████╗██╗██╗     ███████╗███████╗███████╗██████╗ ██╗   ██╗   ║
+  ║   ██╔════╝██║██║     ██╔════╝██╔════╝██╔════╝██╔══██╗██║   ██║   ║
+  ║   █████╗  ██║██║     █████╗  ███████╗█████╗  ██████╔╝██║   ██║   ║
+  ║   ██╔══╝  ██║██║     ██╔══╝  ╚════██║██╔══╝  ██╔══██╗╚██╗ ██╔╝   ║
+  ║   ██║     ██║███████╗███████╗███████║███████╗██║  ██║ ╚████╔╝    ║
+  ║   ╚═╝     ╚═╝╚══════╝╚══════╝╚══════╝╚══════╝╚═╝  ╚═╝  ╚═══╝     ║
+  ║                                                                  ║
+  ║              A Modern Multi-Directory File Server                ║
+  ╚══════════════════════════════════════════════════════════════════╝
+`)
+	fmt.Printf("  Version: %s\n\n", version)
+
+	fmt.Println("  USAGE")
+	fmt.Println("  ─────────────────────────────────────────────────────────────")
+	fmt.Println("    fileserv [options] [directories...]")
+	fmt.Println()
+
+	fmt.Println("  OPTIONS")
+	fmt.Println("  ─────────────────────────────────────────────────────────────")
+	fmt.Println("    -port <number>")
+	fmt.Println("        Port to serve HTTP on (default: 8000)")
+	fmt.Println()
+	fmt.Println("    -dir <paths>")
+	fmt.Println("        Directories to serve (space or comma-separated)")
+	fmt.Println("        Can also pass directories as arguments after flags")
+	fmt.Println("        If not specified, serves the current directory")
+	fmt.Println()
+	fmt.Println("    -version")
+	fmt.Println("        Show version information")
+	fmt.Println()
+	fmt.Println("    -help")
+	fmt.Println("        Show this help message")
+	fmt.Println()
+
+	fmt.Println("  EXAMPLES")
+	fmt.Println("  ─────────────────────────────────────────────────────────────")
+	fmt.Println("    # Serve current directory on default port")
+	fmt.Println("    $ fileserv")
+	fmt.Println()
+	fmt.Println("    # Serve on custom port")
+	fmt.Println("    $ fileserv -port 3000")
+	fmt.Println()
+	fmt.Println("    # Serve multiple directories (space-separated)")
+	fmt.Println("    $ fileserv -dir ~/Documents ~/Downloads ~/Pictures")
+	fmt.Println()
+	fmt.Println("    # Serve multiple directories (comma-separated)")
+	fmt.Println("    $ fileserv -dir ~/Documents,~/Downloads,~/Pictures")
+	fmt.Println()
+	fmt.Println("    # Serve with custom port (flags in any order)")
+	fmt.Println("    $ fileserv -port 3000 -dir ~/Documents ~/Downloads")
+	fmt.Println("    $ fileserv -dir ~/Documents ~/Downloads -port 3000")
+	fmt.Println()
+	fmt.Println("    # Serve directories as standalone arguments")
+	fmt.Println("    $ fileserv ~/Documents ~/Downloads -port 3000")
+	fmt.Println()
+	fmt.Println("  ─────────────────────────────────────────────────────────────")
+	fmt.Println()
 }
